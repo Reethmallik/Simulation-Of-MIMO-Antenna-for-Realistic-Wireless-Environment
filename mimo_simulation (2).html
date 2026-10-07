@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIMO Simulation</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; margin: 20px; background: #fff; color: #222; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  #status { font-size: 13px; color: #555; margin-bottom: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 16px; }
+  canvas { border: 1px solid #ddd; width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<h1>MIMO Simulation: Rician Fading, Spatial Correlation, Shadowing, SVD Beamforming</h1>
+<div id="status">Running...</div>
+<div class="grid">
+  <canvas id="c1" width="560" height="360"></canvas>
+  <canvas id="c2" width="560" height="360"></canvas>
+  <canvas id="c3" width="560" height="360"></canvas>
+  <canvas id="c4" width="560" height="360"></canvas>
+</div>
+
+<script>
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const rand = makeRng(1);
+let spare = null;
+
+function randn() {
+  if (spare !== null) { const s = spare; spare = null; return s; }
+  let u = 0;
+  while (u === 0) u = rand();
+  const v = rand();
+  const r = Math.sqrt(-2 * Math.log(u));
+  spare = r * Math.sin(2 * Math.PI * v);
+  return r * Math.cos(2 * Math.PI * v);
+}
+
+function cn() { return [randn() / Math.SQRT2, randn() / Math.SQRT2]; }
+function cmul(a, b) { return [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]]; }
+function cadd(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
+function cabs2(a) { return a[0] * a[0] + a[1] * a[1]; }
+
+function matmul(A, B) {
+  return [
+    cadd(cmul(A[0], B[0]), cmul(A[1], B[2])),
+    cadd(cmul(A[0], B[1]), cmul(A[1], B[3])),
+    cadd(cmul(A[2], B[0]), cmul(A[3], B[2])),
+    cadd(cmul(A[2], B[1]), cmul(A[3], B[3]))
+  ];
+}
+
+function sqrtCorr(a) {
+  const s1 = Math.sqrt(1 + a), s2 = Math.sqrt(1 - a);
+  const d = (s1 + s2) / 2, o = (s1 - s2) / 2;
+  return [[d, 0], [o, 0], [o, 0], [d, 0]];
+}
+
+const numTx = 2;
+const numRx = 2;
+const fc = 2.4e9;
+const Pt_dBm = 0;
+const Pt = Math.pow(10, (Pt_dBm - 30) / 10);
+
+const K = 10;
+const shadowingStd = 6;
+const RxCorrS = sqrtCorr(0.5);
+const TxCorrS = sqrtCorr(0.7);
+
+const BW = 10e6;
+const N0_dBmHz = -174;
+const NF = 7;
+const Noise_dBm = N0_dBmHz + 10 * Math.log10(BW) + NF;
+const N0 = Math.pow(10, (Noise_dBm - 30) / 10);
+
+const numDistances = 50;
+const d = Array.from({ length: numDistances }, (_, i) => 10 + (500 - 10) * i / (numDistances - 1));
+const numTrials = 1000;
+const R_target = 10;
+const estErrorVar = 0.05;
+
+const antennaGain = theta => 10 * Math.log10(Math.cos(theta) ** 2 + 0.01);
+const PL_3GPP = dist => 28.0 + 22 * Math.log10(dist) + 20 * Math.log10(fc / 1e9);
+
+const G_tx = Math.pow(10, antennaGain(0) / 10);
+const G_rx = Math.pow(10, antennaGain(0) / 10);
+
+function simulate() {
+  const Pr_dBm = [], Capacity = [], OutageProb = [];
+  const aLoS = Math.sqrt(K / (K + 1));
+  const bNLoS = Math.sqrt(1 / (K + 1));
+  const eStd = Math.sqrt(estErrorVar);
+
+  for (let idx = 0; idx < numDistances; idx++) {
+    const di = d[idx];
+    let prSum = 0, capSum = 0, outCount = 0;
+
+    for (let t = 0; t < numTrials; t++) {
+      const PL_dB = PL_3GPP(di) + shadowingStd * randn();
+      const Pr = Pt * G_tx * G_rx * Math.pow(10, -PL_dB / 10);
+
+      let Hn = [cn(), cn(), cn(), cn()];
+      Hn = matmul(matmul(RxCorrS, Hn), TxCorrS);
+      const H = Hn.map(x => [aLoS + bNLoS * x[0], bNLoS * x[1]]);
+      const He = H.map(x => { const e = cn(); return [x[0] + eStd * e[0], x[1] + eStd * e[1]]; });
+
+      const a = cabs2(He[0]) + cabs2(He[2]);
+      const c = cabs2(He[1]) + cabs2(He[3]);
+      const b = cadd(
+        cmul([He[0][0], -He[0][1]], He[1]),
+        cmul([He[2][0], -He[2][1]], He[3])
+      );
+      const lambda = (a + c) / 2 + Math.sqrt(((a - c) / 2) ** 2 + cabs2(b));
+
+      let v0, v1;
+      if (cabs2(b) < 1e-24) {
+        v0 = a >= c ? [1, 0] : [0, 0];
+        v1 = a >= c ? [0, 0] : [1, 0];
+      } else {
+        v0 = b;
+        v1 = [lambda - a, 0];
+      }
+      const nv = Math.sqrt(cabs2(v0) + cabs2(v1));
+      v0 = [v0[0] / nv, v0[1] / nv];
+      v1 = [v1[0] / nv, v1[1] / nv];
+
+      const h0 = cadd(cmul(H[0], v0), cmul(H[1], v1));
+      const h1 = cadd(cmul(H[2], v0), cmul(H[3], v1));
+      const SNR = ((cabs2(h0) + cabs2(h1)) * Pr) / N0;
+      const C = Math.log2(1 + SNR);
+
+      prSum += Pr;
+      capSum += C;
+      if (C < R_target) outCount++;
+    }
+
+    Pr_dBm.push(10 * Math.log10((prSum / numTrials) * 1000));
+    Capacity.push(capSum / numTrials);
+    OutageProb.push(outCount / numTrials);
+  }
+  return { Pr_dBm, Capacity, OutageProb };
+}
+
+function niceTicks(min, max, n) {
+  const raw = (max - min) / n;
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const f = raw / p;
+  const step = (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * p;
+  const ticks = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-6; v += step) ticks.push(+v.toFixed(10));
+  return ticks;
+}
+
+function chart(id, xs, ys, o) {
+  const cv = document.getElementById(id);
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const L = 64, R = 18, T = 34, B = 48;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+
+  const xmin = xs[0], xmax = xs[xs.length - 1];
+  let ymin, ymax, yTicks;
+  const tr = o.log ? v => Math.log10(Math.max(v, o.floor)) : v => v;
+
+  if (o.log) {
+    ymin = Math.log10(o.ymin); ymax = Math.log10(o.ymax);
+    yTicks = [];
+    for (let e = Math.ceil(ymin); e <= ymax; e++) yTicks.push(e);
+  } else {
+    const lo = Math.min(...ys), hi = Math.max(...ys);
+    const pad = (hi - lo) * 0.06 || 1;
+    yTicks = niceTicks(lo - pad, hi + pad, 6);
+    ymin = yTicks[0]; ymax = yTicks[yTicks.length - 1];
+  }
+
+  const X = x => L + (x - xmin) / (xmax - xmin) * (W - L - R);
+  const Y = y => T + (1 - (y - ymin) / (ymax - ymin)) * (H - T - B);
+
+  ctx.strokeStyle = '#e3e3e3'; ctx.fillStyle = '#333';
+  ctx.lineWidth = 1; ctx.font = '12px Arial';
+
+  ctx.textAlign = 'center';
+  for (const x of niceTicks(xmin, xmax, 6)) {
+    ctx.beginPath(); ctx.moveTo(X(x), T); ctx.lineTo(X(x), H - B); ctx.stroke();
+    ctx.fillText(x, X(x), H - B + 16);
+  }
+  ctx.textAlign = 'right';
+  for (const y of yTicks) {
+    ctx.beginPath(); ctx.moveTo(L, Y(y)); ctx.lineTo(W - R, Y(y)); ctx.stroke();
+    ctx.fillText(o.log ? '1e' + y : y, L - 6, Y(y) + 4);
+  }
+
+  ctx.strokeStyle = '#000';
+  ctx.strokeRect(L, T, W - L - R, H - T - B);
+
+  ctx.strokeStyle = '#0072BD'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  xs.forEach((x, i) => {
+    const y = Math.min(Math.max(tr(ys[i]), ymin), ymax);
+    i === 0 ? ctx.moveTo(X(x), Y(y)) : ctx.lineTo(X(x), Y(y));
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = '#000';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 14px Arial';
+  ctx.fillText(o.title, (L + W - R) / 2, 20);
+  ctx.font = '13px Arial';
+  ctx.fillText(o.xlabel, (L + W - R) / 2, H - 10);
+  ctx.save();
+  ctx.translate(16, (T + H - B) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText(o.ylabel, 0, 0);
+  ctx.restore();
+}
+
+function polar(id, title) {
+  const cv = document.getElementById(id);
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H / 2 + 8, Rad = Math.min(W, H) / 2 - 42;
+  const gmin = -20, gmax = 0;
+
+  ctx.strokeStyle = '#ddd'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#333'; ctx.font = '11px Arial'; ctx.textAlign = 'center';
+  for (let g = gmin; g <= gmax; g += 5) {
+    const r = Rad * (g - gmin) / (gmax - gmin);
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI); ctx.stroke();
+    if (g > gmin) ctx.fillText(g, cx + 3 + r * Math.cos(Math.PI / 4), cy - r * Math.sin(Math.PI / 4));
+  }
+  for (let a = 0; a < 360; a += 30) {
+    const t = a * Math.PI / 180;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Rad * Math.cos(t), cy - Rad * Math.sin(t)); ctx.stroke();
+    ctx.fillText(a + '°', cx + (Rad + 18) * Math.cos(t), cy - (Rad + 18) * Math.sin(t) + 4);
+  }
+
+  ctx.strokeStyle = '#0072BD'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let deg = -90; deg <= 90; deg++) {
+    const t = deg * Math.PI / 180;
+    const g = Math.min(Math.max(antennaGain(t), gmin), gmax);
+    const r = Rad * (g - gmin) / (gmax - gmin);
+    const x = cx + r * Math.cos(t), y = cy - r * Math.sin(t);
+    deg === -90 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = '#000'; ctx.font = 'bold 14px Arial';
+  ctx.fillText(title, W / 2, 20);
+}
+
+const res = simulate();
+
+chart('c1', d, res.Pr_dBm, { title: 'Received Power vs Distance', xlabel: 'Distance (m)', ylabel: 'Received Power (dBm)' });
+chart('c2', d, res.Capacity, { title: 'MIMO Capacity vs Distance', xlabel: 'Distance (m)', ylabel: 'Capacity (bps/Hz)' });
+chart('c3', d, res.OutageProb, {
+  title: 'Outage Probability (Target: ' + R_target + ' bps/Hz)',
+  xlabel: 'Distance (m)', ylabel: 'Outage Probability',
+  log: true, ymin: 1e-3, ymax: 1, floor: 1e-3
+});
+polar('c4', 'Antenna Radiation Pattern (dBi)');
+
+document.getElementById('status').textContent =
+  'Done. Noise power: ' + Noise_dBm.toFixed(1) + ' dBm | Tx power: ' + Pt_dBm + ' dBm | ' +
+  numTrials + ' trials per distance, ' + numDistances + ' distances.';
+</script>
+</body>
+</html>
